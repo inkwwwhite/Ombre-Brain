@@ -21,7 +21,7 @@ from typing import Optional
 
 import httpx
 import jwt
-from passlib.context import CryptContext
+import bcrypt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -59,10 +59,26 @@ if not JWT_SECRET:
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_DAYS = 30  # token 有效期 30 天
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def _hash_password(password: str) -> bytes:
+    """用 bcrypt 哈希密码。bcrypt 限制密码最长 72 字节，超过的截断。"""
+    pw_bytes = password.encode("utf-8")[:72]
+    return bcrypt.hashpw(pw_bytes, bcrypt.gensalt())
+
+
+def _verify_password(password: str, hashed: bytes) -> bool:
+    """验证密码"""
+    if not hashed:
+        return False
+    try:
+        pw_bytes = password.encode("utf-8")[:72]
+        return bcrypt.checkpw(pw_bytes, hashed)
+    except Exception:
+        return False
+
 
 # 启动时把明文密码哈希一次缓存起来
-AUTH_PASSWORD_HASH = pwd_context.hash(AUTH_PASSWORD) if AUTH_PASSWORD else ""
+AUTH_PASSWORD_HASH = _hash_password(AUTH_PASSWORD) if AUTH_PASSWORD else b""
 
 AUTH_ENABLED = bool(AUTH_USERNAME and AUTH_PASSWORD)
 if not AUTH_ENABLED:
@@ -206,7 +222,7 @@ async def api_login(request):
         await asyncio.sleep(0.3)
         return _json_response({"error": "用户名或密码错误"}, status=401)
 
-    if not pwd_context.verify(password, AUTH_PASSWORD_HASH):
+    if not _verify_password(password, AUTH_PASSWORD_HASH):
         await asyncio.sleep(0.3)
         return _json_response({"error": "用户名或密码错误"}, status=401)
 
