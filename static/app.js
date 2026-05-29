@@ -1,42 +1,41 @@
 /* ============================================================
    砚池 · Ombre Brain Mobile
-   前端逻辑
+   前端逻辑：调用原作者的 API + 我加的几个补丁路由
+   认证：cookie session（fetch 自动带 cookie）
    ============================================================ */
 
 const API_BASE = window.location.origin;
-const TOKEN_KEY = 'ombre_token';
 
 const state = {
-  token: localStorage.getItem(TOKEN_KEY) || null,
   buckets: [],
-  stats: null,
   filter: 'all',
   search: '',
   includeArchive: false,
-  current: null,   // 当前查看/编辑的桶
+  current: null,
   editing: false,
 };
 
 // ============================================================
-// API
+// API 调用
 // ============================================================
 
 async function api(path, opts = {}) {
-  const headers = {
-    'Content-Type': 'application/json',
-    ...(opts.headers || {}),
-  };
-  if (state.token) {
-    headers['Authorization'] = `Bearer ${state.token}`;
-  }
-  const resp = await fetch(`${API_BASE}${path}`, { ...opts, headers });
+  const resp = await fetch(`${API_BASE}${path}`, {
+    ...opts,
+    credentials: 'include', // 关键：自动带 cookie
+    headers: {
+      'Content-Type': 'application/json',
+      ...(opts.headers || {}),
+    },
+  });
+
+  // 401 → 跳回登录页
   if (resp.status === 401) {
-    state.token = null;
-    localStorage.removeItem(TOKEN_KEY);
     showLogin();
     throw new Error('未登录');
   }
-  const data = await resp.json();
+
+  const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     throw new Error(data.error || `${resp.status}`);
   }
@@ -44,12 +43,17 @@ async function api(path, opts = {}) {
 }
 
 // ============================================================
-// 登录
+// 登录与认证状态检查
 // ============================================================
 
 function showLogin() {
   document.getElementById('page-login').classList.remove('hidden');
   document.getElementById('page-main').classList.add('hidden');
+  // 让密码框拿到焦点
+  setTimeout(() => {
+    const pw = document.getElementById('login-pass');
+    if (pw) pw.focus();
+  }, 100);
 }
 
 function showMain() {
@@ -58,45 +62,73 @@ function showMain() {
   loadBuckets();
 }
 
+async function checkAuth() {
+  try {
+    const data = await fetch(`${API_BASE}/auth/status`, {
+      credentials: 'include',
+    }).then(r => r.json());
+
+    if (data.setup_needed) {
+      // 服务器还没设置密码，提示去 dashboard 完成首次设置
+      document.getElementById('login-tip').textContent =
+        '首次使用：请先在网页端 /dashboard 设置密码';
+      showLogin();
+      return false;
+    }
+
+    if (data.authenticated) {
+      showMain();
+      return true;
+    }
+
+    showLogin();
+    return false;
+  } catch (e) {
+    document.getElementById('login-tip').textContent = '服务器连接失败';
+    showLogin();
+    return false;
+  }
+}
+
 document.getElementById('login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const btn = document.getElementById('login-btn');
   const err = document.getElementById('login-error');
   err.textContent = '';
   btn.disabled = true;
+  const oldText = btn.textContent;
   btn.textContent = '...';
 
   try {
-    const data = await fetch(`${API_BASE}/api/login`, {
+    const password = document.getElementById('login-pass').value;
+    const resp = await fetch(`${API_BASE}/auth/login`, {
       method: 'POST',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        username: document.getElementById('login-user').value,
-        password: document.getElementById('login-pass').value,
-      }),
-    }).then(r => r.json().then(d => ({ ok: r.ok, ...d })));
+      body: JSON.stringify({ password }),
+    });
+    const data = await resp.json().catch(() => ({}));
 
-    if (!data.ok) {
-      err.textContent = data.error || '登录失败';
+    if (!resp.ok) {
+      err.textContent = data.error || '密码错误';
       btn.disabled = false;
-      btn.textContent = '入';
+      btn.textContent = oldText;
       return;
     }
 
-    state.token = data.token;
-    localStorage.setItem(TOKEN_KEY, data.token);
-    btn.textContent = '入';
+    btn.textContent = oldText;
     btn.disabled = false;
+    document.getElementById('login-pass').value = '';
     showMain();
   } catch (e) {
     err.textContent = '网络错误';
     btn.disabled = false;
-    btn.textContent = '入';
+    btn.textContent = oldText;
   }
 });
 
 // ============================================================
-// 列表
+// 加载列表
 // ============================================================
 
 async function loadBuckets() {
@@ -104,19 +136,19 @@ async function loadBuckets() {
   container.innerHTML = '<div class="loading-row">浮现中</div>';
 
   try {
-    const data = await api(`/api/buckets?include_archive=${state.includeArchive}`);
-    state.buckets = data.buckets;
-    state.stats = data.stats;
+    // 原作者的 /api/buckets 直接返回数组
+    const buckets = await api('/api/buckets');
+    state.buckets = Array.isArray(buckets) ? buckets : [];
     renderList();
     renderStats();
   } catch (e) {
-    container.innerHTML = `<div class="loading-row">${e.message}</div>`;
+    container.innerHTML = `<div class="loading-row">${escapeHtml(e.message)}</div>`;
   }
 }
 
 function renderList() {
   const container = document.getElementById('list-container');
-  let list = state.buckets;
+  let list = state.buckets.slice();
 
   // 筛选
   if (state.filter === 'pinned') {
@@ -127,6 +159,9 @@ function renderList() {
     list = list.filter(b => b.resolved);
   } else if (state.filter === 'archive') {
     list = list.filter(b => b.type === 'archived');
+  } else if (!state.includeArchive) {
+    // 'all' 默认隐藏归档
+    list = list.filter(b => b.type !== 'archived');
   }
 
   // 搜索
@@ -140,7 +175,7 @@ function renderList() {
     });
   }
 
-  // 排序：钉选优先，然后按权重
+  // 排序：钉选优先，然后按 score
   list.sort((a, b) => {
     if (a.pinned !== b.pinned) return b.pinned ? 1 : -1;
     return (b.score || 0) - (a.score || 0);
@@ -158,14 +193,13 @@ function renderList() {
 
   container.innerHTML = list.map(renderBucketItem).join('');
 
-  // 绑定点击
   container.querySelectorAll('.bucket-item').forEach(el => {
     el.addEventListener('click', () => openDetail(el.dataset.id));
   });
 }
 
 function iconFor(b) {
-  if (b.pinned) return '📌';
+  if (b.pinned) return '★';
   if (b.type === 'archived') return '○';
   if (b.resolved) return '·';
   if (b.type === 'permanent') return '◆';
@@ -179,11 +213,10 @@ function renderBucketItem(b) {
     b.resolved ? 'bucket-resolved' : '',
   ].join(' ').trim();
 
-  const domains = (b.domain || []).map(d => `<span>${escapeHtml(d)}</span>`).join('·');
-  const importanceDots = '○'.repeat(Math.max(0, 10 - b.importance)) + '●'.repeat(Math.min(10, b.importance || 0));
+  const domains = (b.domain || []).slice(0, 3).map(d => escapeHtml(d)).join(' · ');
 
   return `
-    <article class="${cls}" data-id="${b.id}">
+    <article class="${cls}" data-id="${escapeAttr(b.id)}">
       <div class="bucket-head">
         <span class="bucket-icon">${iconFor(b)}</span>
         <span class="bucket-name">${escapeHtml(b.name || b.id)}</span>
@@ -191,22 +224,26 @@ function renderBucketItem(b) {
       </div>
       ${b.content_preview ? `<div class="bucket-preview">${escapeHtml(b.content_preview)}</div>` : ''}
       <div class="bucket-meta">
-        ${domains ? `<span>${domains}</span>` : ''}
-        ${domains ? '<span class="dot">·</span>' : ''}
-        <span>重 ${b.importance}</span>
+        ${domains ? `<span>${domains}</span><span class="dot">·</span>` : ''}
+        <span>重 ${b.importance || 5}</span>
         <span class="dot">·</span>
-        <span>V${(b.valence || 0).toFixed(1)} / A${(b.arousal || 0).toFixed(1)}</span>
+        <span>V${(b.valence || 0).toFixed(1)} A${(b.arousal || 0).toFixed(1)}</span>
       </div>
     </article>
   `;
 }
 
 function renderStats() {
-  if (!state.stats) return;
-  document.getElementById('stat-permanent').textContent = `钉 ${state.stats.permanent}`;
-  document.getElementById('stat-dynamic').textContent = `动 ${state.stats.dynamic}`;
-  document.getElementById('stat-archive').textContent = `归 ${state.stats.archive}`;
-  document.getElementById('stat-size').textContent = `${state.stats.total_kb} KB`;
+  const stats = state.buckets.reduce((acc, b) => {
+    if (b.pinned) acc.pinned++;
+    else if (b.type === 'archived') acc.archive++;
+    else acc.dynamic++;
+    return acc;
+  }, { pinned: 0, dynamic: 0, archive: 0 });
+
+  document.getElementById('stat-permanent').textContent = `钉 ${stats.pinned}`;
+  document.getElementById('stat-dynamic').textContent = `动 ${stats.dynamic}`;
+  document.getElementById('stat-archive').textContent = `归 ${stats.archive}`;
 }
 
 // ============================================================
@@ -222,11 +259,24 @@ async function openDetail(id) {
   state.editing = false;
 
   try {
-    const data = await api(`/api/buckets/${encodeURIComponent(id)}`);
+    // 原作者的接口是单数 /api/bucket/{id}
+    const data = await api(`/api/bucket/${encodeURIComponent(id)}`);
     state.current = data;
     renderDetail();
   } catch (e) {
-    body.innerHTML = `<div class="loading-row">${e.message}</div>`;
+    body.innerHTML = `<div class="loading-row">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function formatDate(d) {
+  if (!d) return '-';
+  try {
+    return new Date(d).toLocaleString('zh-CN', {
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    });
+  } catch (e) {
+    return d;
   }
 }
 
@@ -245,9 +295,6 @@ function renderDetail() {
     `<span class="bucket-tag">${escapeHtml(t)}</span>`
   ).join('');
 
-  const created = meta.created_at ? new Date(meta.created_at).toLocaleString('zh-CN', { hour12: false }) : '?';
-  const lastActive = meta.last_active ? new Date(meta.last_active).toLocaleString('zh-CN', { hour12: false }) : '?';
-
   document.getElementById('drawer-body').innerHTML = `
     ${domains ? `<div class="detail-domain">${domains}</div>` : ''}
     <div class="detail-meta">
@@ -259,13 +306,13 @@ function renderDetail() {
     <div class="detail-content">${escapeHtml(b.content || '')}</div>
     ${tags ? `<div class="detail-tags">${tags}</div>` : ''}
     <div class="detail-meta">
-      <span class="detail-meta-item"><span class="detail-meta-label">建</span> ${created}</span>
-      <span class="detail-meta-item"><span class="detail-meta-label">激</span> ${lastActive}</span>
+      <span class="detail-meta-item"><span class="detail-meta-label">建</span> ${formatDate(meta.created)}</span>
+      <span class="detail-meta-item"><span class="detail-meta-label">激</span> ${formatDate(meta.last_active)}</span>
     </div>
     <div class="detail-actions">
-      <button class="btn" id="act-resolve">${meta.resolved ? '激活' : '沉底'}</button>
-      <button class="btn" id="act-pin">${meta.pinned ? '取消钉' : '钉选'}</button>
-      <button class="btn btn-danger" id="act-delete">删除</button>
+      <button class="btn" type="button" id="act-resolve">${meta.resolved ? '激活' : '沉底'}</button>
+      <button class="btn" type="button" id="act-pin">${meta.pinned ? '取消钉' : '钉选'}</button>
+      <button class="btn btn-danger" type="button" id="act-delete">删除</button>
     </div>
   `;
 
@@ -277,13 +324,12 @@ function renderDetail() {
 async function toggleField(field, value) {
   if (!state.current) return;
   try {
-    await api(`/api/buckets/${encodeURIComponent(state.current.id)}`, {
+    await api(`/api/bucket/${encodeURIComponent(state.current.id)}`, {
       method: 'PATCH',
       body: JSON.stringify({ [field]: value }),
     });
-    toast(field === 'resolved' ? (value ? '已沉底' : '已激活') : (value ? '已钉选' : '已取消钉选'));
-    // 刷新当前详情和列表
-    const fresh = await api(`/api/buckets/${encodeURIComponent(state.current.id)}`);
+    toast(field === 'resolved' ? (value ? '已沉底' : '已激活') : (value ? '已钉选' : '已取消'));
+    const fresh = await api(`/api/bucket/${encodeURIComponent(state.current.id)}`);
     state.current = fresh;
     renderDetail();
     loadBuckets();
@@ -294,10 +340,11 @@ async function toggleField(field, value) {
 
 async function confirmDelete() {
   if (!state.current) return;
-  if (!confirm(`确定要遗忘「${state.current.metadata.name || state.current.id}」吗？`)) return;
+  const name = state.current.metadata.name || state.current.id;
+  if (!confirm(`确定要遗忘「${name}」吗？`)) return;
 
   try {
-    await api(`/api/buckets/${encodeURIComponent(state.current.id)}`, { method: 'DELETE' });
+    await api(`/api/bucket/${encodeURIComponent(state.current.id)}`, { method: 'DELETE' });
     toast('已遗忘');
     closeDrawer();
     loadBuckets();
@@ -314,7 +361,7 @@ function renderEditForm() {
   document.getElementById('drawer-title').textContent = '编辑';
 
   document.getElementById('drawer-body').innerHTML = `
-    <form class="edit-form" id="edit-form">
+    <form class="edit-form" id="edit-form" autocomplete="off">
       <div class="field">
         <span class="field-label">名称</span>
         <input type="text" name="name" value="${escapeAttr(meta.name || '')}">
@@ -350,13 +397,14 @@ function renderEditForm() {
     </form>
   `;
 
-  // 滑块联动显示
   ['importance', 'valence', 'arousal'].forEach(name => {
     const input = document.querySelector(`[name="${name}"]`);
     const val = document.getElementById(`val-${name}`);
-    input.addEventListener('input', () => {
-      val.textContent = name === 'importance' ? input.value : parseFloat(input.value).toFixed(2);
-    });
+    if (input && val) {
+      input.addEventListener('input', () => {
+        val.textContent = name === 'importance' ? input.value : parseFloat(input.value).toFixed(2);
+      });
+    }
   });
 
   document.getElementById('edit-cancel').addEventListener('click', () => {
@@ -381,12 +429,12 @@ async function saveEdit(e) {
   };
 
   try {
-    await api(`/api/buckets/${encodeURIComponent(state.current.id)}`, {
+    await api(`/api/bucket/${encodeURIComponent(state.current.id)}`, {
       method: 'PATCH',
       body: JSON.stringify(payload),
     });
     toast('已保存');
-    const fresh = await api(`/api/buckets/${encodeURIComponent(state.current.id)}`);
+    const fresh = await api(`/api/bucket/${encodeURIComponent(state.current.id)}`);
     state.current = fresh;
     state.editing = false;
     renderDetail();
@@ -403,11 +451,11 @@ function renderNewForm() {
   document.getElementById('drawer-title').textContent = '新建';
 
   document.getElementById('drawer-body').innerHTML = `
-    <form class="edit-form" id="new-form">
-      <p class="foot-tip" style="margin-bottom:12px">系统会自动分析内容并打标，你也可以手动指定。</p>
+    <form class="edit-form" id="new-form" autocomplete="off">
+      <p class="foot-tip" style="margin-bottom:8px">系统会自动分析内容并打标。</p>
       <div class="field">
         <span class="field-label">内容</span>
-        <textarea name="content" autofocus placeholder="想存什么..."></textarea>
+        <textarea name="content" placeholder="想存什么..." required></textarea>
       </div>
       <div class="slider-row">
         <label>重要度 <span class="val" id="val-importance">5</span></label>
@@ -456,7 +504,7 @@ function renderNewForm() {
     };
     try {
       toast('打标中');
-      await api('/api/buckets', {
+      await api('/api/hold', {
         method: 'POST',
         body: JSON.stringify(payload),
       });
@@ -484,7 +532,6 @@ function toast(msg) {
   const el = document.getElementById('toast');
   el.textContent = msg;
   el.classList.remove('hidden');
-  // 重置动画
   el.style.animation = 'none';
   void el.offsetWidth;
   el.style.animation = '';
@@ -493,11 +540,11 @@ function toast(msg) {
 }
 
 // ============================================================
-// 辅助
+// HTML 转义
 // ============================================================
 
 function escapeHtml(s) {
-  return String(s || '')
+  return String(s == null ? '' : s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -513,7 +560,6 @@ function escapeAttr(s) {
 // 事件绑定
 // ============================================================
 
-// 筛选 chip
 document.querySelectorAll('.chip').forEach(chip => {
   chip.addEventListener('click', () => {
     document.querySelectorAll('.chip').forEach(c => c.classList.remove('chip-active'));
@@ -523,7 +569,6 @@ document.querySelectorAll('.chip').forEach(chip => {
   });
 });
 
-// 搜索
 let searchTimer = null;
 document.getElementById('search-input').addEventListener('input', (e) => {
   clearTimeout(searchTimer);
@@ -533,15 +578,14 @@ document.getElementById('search-input').addEventListener('input', (e) => {
   }, 200);
 });
 
-// 顶栏按钮
 document.getElementById('btn-new').addEventListener('click', renderNewForm);
 document.getElementById('btn-menu').addEventListener('click', () => {
   document.getElementById('sidemenu').classList.remove('hidden');
 });
 
-// 抽屉
 document.getElementById('drawer-close').addEventListener('click', closeDrawer);
-document.querySelector('#drawer .drawer-backdrop').addEventListener('click', closeDrawer);
+document.getElementById('drawer-backdrop').addEventListener('click', closeDrawer);
+
 document.getElementById('drawer-edit').addEventListener('click', () => {
   if (!state.current) return;
   state.editing = !state.editing;
@@ -552,32 +596,35 @@ document.getElementById('drawer-edit').addEventListener('click', () => {
   }
 });
 
-// 侧边菜单
-document.querySelector('#sidemenu .sidemenu-backdrop').addEventListener('click', () => {
+document.getElementById('sidemenu-backdrop').addEventListener('click', () => {
   document.getElementById('sidemenu').classList.add('hidden');
 });
 
 document.getElementById('menu-refresh').addEventListener('click', () => {
   document.getElementById('sidemenu').classList.add('hidden');
   loadBuckets();
-  toast('已刷新');
+  toast('刷新');
 });
 
 document.getElementById('menu-archive-toggle').addEventListener('click', () => {
   state.includeArchive = !state.includeArchive;
   document.getElementById('menu-archive-state').textContent = state.includeArchive ? '开' : '关';
-  loadBuckets();
+  renderList();
 });
 
-document.getElementById('menu-logout').addEventListener('click', () => {
+document.getElementById('menu-logout').addEventListener('click', async () => {
   if (!confirm('确定要登出吗？')) return;
-  state.token = null;
-  localStorage.removeItem(TOKEN_KEY);
+  try {
+    await fetch(`${API_BASE}/auth/logout`, {
+      method: 'POST',
+      credentials: 'include',
+    });
+  } catch (e) {}
   document.getElementById('sidemenu').classList.add('hidden');
   showLogin();
 });
 
-// 下拉刷新（轻量实现）
+// 下拉刷新
 let touchStart = 0;
 let pulling = false;
 const listEl = document.getElementById('list-container');
@@ -603,26 +650,13 @@ listEl.addEventListener('touchend', () => { pulling = false; });
 // ============================================================
 
 (async () => {
-  // 显示版本信息
+  // 启动时直接检查认证状态
+  await checkAuth();
+
+  // 加载 health
   try {
-    const h = await fetch(`${API_BASE}/health`).then(r => r.json());
+    const h = await fetch(`${API_BASE}/health`, { credentials: 'include' }).then(r => r.json());
     document.getElementById('foot-version').textContent =
       `桶 ${h.buckets} · 衰减 ${h.decay_engine === 'running' ? '运行' : '停'}`;
-    document.getElementById('menu-user').textContent =
-      h.auth_enabled ? '已登录' : '匿名模式';
   } catch (e) {}
-
-  // 检查 token
-  if (!state.token) {
-    showLogin();
-    return;
-  }
-
-  // 验证 token
-  try {
-    await api('/api/me');
-    showMain();
-  } catch (e) {
-    showLogin();
-  }
 })();
