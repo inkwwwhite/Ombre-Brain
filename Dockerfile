@@ -1,6 +1,5 @@
 # ============================================================
 # Ombre Brain Docker Build
-# Docker 构建文件
 # ============================================================
 
 FROM python:3.12-slim
@@ -11,11 +10,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy project files / 复制项目文件
+# Copy project files
 COPY *.py .
 COPY config.example.yaml ./config.yaml
 
-# Copy frontend static files / 复制前端静态文件
+# Copy dashboard HTML (原作者的网页端 dashboard)
+COPY dashboard.html ./dashboard.html
+
+# Copy PWA static files (我加的手机端)
 COPY static/ ./static/
 
 # Persistent mount point: bucket data
